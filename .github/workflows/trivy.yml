@@ -3,11 +3,11 @@ name: Trivy PR Scan
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [main, master, develop]  # Adjust to your target branch
+    branches: [main, master, develop]
 
 permissions:
   contents: read
-  pull-requests: write  # Required for creating/updating PR comments
+  pull-requests: write
 
 jobs:
   trivy-scan:
@@ -17,21 +17,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master  # Or pin to a version like @0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
-          scan-type: 'fs'  # Options: 'fs' (repo), 'image-ref' (Docker), etc.
-          scan-ref: '.'    # Scan the entire repo; adjust path as needed
-          format: 'json'   # JSON for easy parsing; use 'table' for raw output
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
           output: 'trivy-results.json'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN'  # Adjust thresholds
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN'
           ignore-unfixed: true
-          vuln-type: 'os,library'  # Customize as needed
+          vuln-type: 'os,library'
           hide-progress: false
-          scanners: 'vuln,secret,config'  # Explicitly enable secret scanning (and others)
-        continue-on-error: true  # Don't fail the workflow on findings; report them
+          scanners: 'vuln,secret,config'
+        continue-on-error: true
 
       - name: Update PR with Trivy results
-        if: github.event.pull_request  # More reliable check for PR context
+        if: github.event.pull_request
         uses: actions/github-script@v7
         env:
           GITHUB_SHA: ${{ github.sha }}
@@ -46,65 +46,192 @@ jobs:
             if (fs.existsSync('trivy-results.json')) {
               const rawData = fs.readFileSync('trivy-results.json', 'utf8');
               rawResults = JSON.parse(rawData);
-              console.log('Full Results Structure:', JSON.stringify(rawResults, null, 2));
             }
 
-            // Process results for vulnerabilities
-            const vulnResult = rawResults.Results?.find(r => r.Class === 'os-pkgs' || r.Class === 'lang-pkgs') || {};
-            const vulnerabilities = vulnResult.Vulnerabilities || [];
-            const vulnCount = vulnerabilities.length;
+            // Aggregate vulnerabilities from ALL results
+            const allVulnerabilities = [];
+            const allSecrets = [];
+            const allMisconfigurations = [];
 
-            // Process results for secrets
-            const secretResult = rawResults.Results?.find(r => r.Class === 'secret') || {};
-            const secrets = secretResult.Secrets || [];  // Changed from Misconfigurations/Vulnerabilities
-            const secretCount = secrets.length;
+            if (rawResults.Results) {
+              rawResults.Results.forEach(result => {
+                const target = result.Target || 'Unknown';
+                
+                // Collect vulnerabilities (class: os-pkgs, lang-pkgs, or just vulnerabilities)
+                if (result.Vulnerabilities && Array.isArray(result.Vulnerabilities)) {
+                  result.Vulnerabilities.forEach(vuln => {
+                    allVulnerabilities.push({
+                      ...vuln,
+                      Target: target
+                    });
+                  });
+                }
+                
+                // Collect secrets (class: secret)
+                if (result.Secrets && Array.isArray(result.Secrets)) {
+                  result.Secrets.forEach(secret => {
+                    allSecrets.push({
+                      ...secret,
+                      Target: target
+                    });
+                  });
+                }
+                
+                // Collect misconfigurations (class: config)
+                if (result.Misconfigurations && Array.isArray(result.Misconfigurations)) {
+                  result.Misconfigurations.forEach(misconfig => {
+                    allMisconfigurations.push({
+                      ...misconfig,
+                      Target: target
+                    });
+                  });
+                }
+              });
+            }
+
+            const vulnCount = allVulnerabilities.length;
+            const secretCount = allSecrets.length;
+            const misconfigCount = allMisconfigurations.length;
+
+            console.log(`Found ${vulnCount} vulnerabilities, ${secretCount} secrets, ${misconfigCount} misconfigurations`);
+
+            // Count vulnerabilities by severity
+            const severityCounts = {
+              CRITICAL: 0,
+              HIGH: 0,
+              MEDIUM: 0,
+              LOW: 0,
+              UNKNOWN: 0
+            };
+
+            allVulnerabilities.forEach(v => {
+              const severity = v.Severity || 'UNKNOWN';
+              if (severityCounts[severity] !== undefined) {
+                severityCounts[severity]++;
+              }
+            });
 
             // Format results as Markdown
-            let body = `## Trivy Security Scan Results (Updated: ${new Date().toISOString().split('T')[0]})\n\n`;
-            body += `Scan completed on \`${process.env.GITHUB_SHA}\`.\n\n`;
-            body += `Found **${vulnCount}** vulnerabilities and **${secretCount}** secrets.\n\n`;
+            let body = `## 🔒 Trivy Security Scan Results\n\n`;
+            body += `**Last Updated:** ${new Date().toISOString().split('T')[0]}\n`;
+            body += `**Commit:** \`${process.env.GITHUB_SHA.substring(0, 7)}\`\n\n`;
+
+            // Summary Table
+            body += `### 📊 Summary\n\n`;
+            body += `| Category | Count |\n`;
+            body += `|----------|-------|\n`;
+            body += `| 🔴 Critical | ${severityCounts.CRITICAL} |\n`;
+            body += `| 🟠 High | ${severityCounts.HIGH} |\n`;
+            body += `| 🟡 Medium | ${severityCounts.MEDIUM} |\n`;
+            body += `| 🟢 Low | ${severityCounts.LOW} |\n`;
+            body += `| 🔑 Secrets | ${secretCount} |\n`;
+            body += `| ⚙️ Misconfigurations | ${misconfigCount} |\n`;
+            body += `| **Total Issues** | **${vulnCount + secretCount + misconfigCount}** |\n\n`;
 
             // Vulnerabilities Section
             if (vulnCount === 0) {
-              body += '### No vulnerabilities detected! ✅\n\n';
+              body += `### ✅ No vulnerabilities detected!\n\n`;
             } else {
-              body += '### Critical/High Vulnerabilities\n';
-              const highCritVulns = vulnerabilities.filter(v => ['CRITICAL', 'HIGH'].includes(v.Severity));
-              if (highCritVulns.length === 0) {
-                body += 'No critical or high severity vulnerabilities found.\n';
-              } else {
-                highCritVulns.forEach(vuln => {
-                  body += `- **${vuln.Severity}**: ${vuln.Title || vuln.VulnerabilityID} (${vuln.PkgName}:${vuln.InstalledVersion} -> ${vuln.FixedVersion || 'unfixed'})\n`;
-                  body += `  *Description*: ${vuln.Description?.substring(0, 200)}...\n`;
-                  body += `  *[Details](${vuln.PrimaryURL || vuln.Reference || '#'})*\n\n`;
+              const criticalVulns = allVulnerabilities.filter(v => v.Severity === 'CRITICAL');
+              const highVulns = allVulnerabilities.filter(v => v.Severity === 'HIGH');
+              
+              if (criticalVulns.length > 0) {
+                body += `### 🔴 Critical Vulnerabilities (${criticalVulns.length})\n\n`;
+                criticalVulns.slice(0, 10).forEach(vuln => {
+                  body += `**${vuln.VulnerabilityID || 'N/A'}** - ${vuln.Title || 'No title'}\n`;
+                  body += `- **Package:** \`${vuln.PkgName}@${vuln.InstalledVersion}\`\n`;
+                  body += `- **File:** ${vuln.Target}\n`;
+                  body += `- **Fixed Version:** ${vuln.FixedVersion || 'Not available'}\n`;
+                  if (vuln.PrimaryURL) {
+                    body += `- **Reference:** ${vuln.PrimaryURL}\n`;
+                  }
+                  body += `\n`;
                 });
+                if (criticalVulns.length > 10) {
+                  body += `*...and ${criticalVulns.length - 10} more critical vulnerabilities*\n\n`;
+                }
               }
-              body += '\n<details><summary>All Vulnerabilities (including Medium/Low)</summary>\n\n';
-              body += '```\n' + JSON.stringify(vulnerabilities, null, 2) + '\n```\n</details>\n\n';
+              
+              if (highVulns.length > 0) {
+                body += `### 🟠 High Vulnerabilities (${highVulns.length})\n\n`;
+                highVulns.slice(0, 5).forEach(vuln => {
+                  body += `**${vuln.VulnerabilityID || 'N/A'}** - ${vuln.Title || 'No title'}\n`;
+                  body += `- **Package:** \`${vuln.PkgName}@${vuln.InstalledVersion}\`\n`;
+                  body += `- **File:** ${vuln.Target}\n`;
+                  body += `- **Fixed Version:** ${vuln.FixedVersion || 'Not available'}\n`;
+                  body += `\n`;
+                });
+                if (highVulns.length > 5) {
+                  body += `*...and ${highVulns.length - 5} more high vulnerabilities*\n\n`;
+                }
+              }
+
+              body += `<details><summary>View all ${vulnCount} vulnerabilities</summary>\n\n`;
+              body += '```json\n' + JSON.stringify(allVulnerabilities, null, 2) + '\n```\n';
+              body += `</details>\n\n`;
             }
 
             // Secrets Section
             if (secretCount === 0) {
-              body += '### No secrets detected! 🔒\n\n';
+              body += `### 🔒 No secrets detected!\n\n`;
             } else {
-              body += '### Detected Secrets (Critical Issues)\n';
-              body += '**Warning**: Exposed secrets can lead to breaches. Review and rotate immediately!\n';
-              secrets.forEach((secret, index) => {
+              body += `### 🔑 Detected Secrets (${secretCount}) ⚠️\n\n`;
+              body += `**Warning:** Exposed secrets can lead to security breaches. Review and rotate immediately!\n\n`;
+              
+              allSecrets.forEach((secret, index) => {
                 const title = secret.Title || secret.RuleID || `Secret ${index + 1}`;
                 const severity = secret.Severity || 'CRITICAL';
-                const match = secret.Match || 'N/A';
-                body += `- **${severity}**: ${title}\n`;
-                body += `  *Location*: ${secret.StartLine ? `Line ${secret.StartLine}` : 'N/A'}\n`;
-                body += `  *Match*: \`${match.substring(0, 50)}...\` (truncated for security)\n\n`;
+                const category = secret.Category || 'Unknown';
+                
+                body += `${index + 1}. **${severity}** - ${title} (${category})\n`;
+                body += `   - **File:** \`${secret.Target}\`\n`;
+                body += `   - **Location:** Line ${secret.StartLine || 'N/A'}\n`;
+                
+                // Truncate match for security
+                if (secret.Match) {
+                  const truncated = secret.Match.substring(0, 60);
+                  body += `   - **Match:** \`${truncated}${secret.Match.length > 60 ? '...' : ''}\`\n`;
+                }
+                body += `\n`;
               });
-              body += '\n<details><summary>Full Secret Results</summary>\n\n';
-              body += '```\n' + JSON.stringify(secrets, null, 2) + '\n```\n</details>\n\n';
+
+              body += `<details><summary>View full secret detection details</summary>\n\n`;
+              body += '```json\n' + JSON.stringify(allSecrets, null, 2) + '\n```\n';
+              body += `</details>\n\n`;
             }
 
-            // Add note if no sections
-            if (vulnCount === 0 && secretCount === 0) {
-              body += 'All clear! No issues found.\n';
+            // Misconfigurations Section
+            if (misconfigCount > 0) {
+              const highMisconfigs = allMisconfigurations.filter(m => ['CRITICAL', 'HIGH'].includes(m.Severity));
+              
+              if (highMisconfigs.length > 0) {
+                body += `### ⚙️ Critical/High Misconfigurations (${highMisconfigs.length})\n\n`;
+                highMisconfigs.forEach((misconfig, index) => {
+                  body += `${index + 1}. **${misconfig.Severity}** - ${misconfig.Title}\n`;
+                  body += `   - **ID:** ${misconfig.ID || 'N/A'}\n`;
+                  body += `   - **File:** \`${misconfig.Target}\`\n`;
+                  body += `   - **Message:** ${misconfig.Message}\n`;
+                  if (misconfig.PrimaryURL) {
+                    body += `   - **Reference:** ${misconfig.PrimaryURL}\n`;
+                  }
+                  body += `\n`;
+                });
+              }
+
+              if (misconfigCount > highMisconfigs.length) {
+                body += `<details><summary>View all ${misconfigCount} misconfigurations</summary>\n\n`;
+                body += '```json\n' + JSON.stringify(allMisconfigurations, null, 2) + '\n```\n';
+                body += `</details>\n\n`;
+              }
             }
+
+            // All clear message
+            if (vulnCount === 0 && secretCount === 0 && misconfigCount === 0) {
+              body += `✨ **All clear!** No security issues found.\n`;
+            }
+
+            body += `\n---\n`;
+            body += `*Scan performed by [Trivy](https://github.com/aquasecurity/trivy)*\n`;
 
             // Check for existing Trivy comment
             const { data: comments } = await github.rest.issues.listComments({
@@ -114,7 +241,7 @@ jobs:
             });
 
             const existingComment = comments.find(comment => 
-              comment.body?.includes('## Trivy Security Scan Results')
+              comment.body?.includes('🔒 Trivy Security Scan Results')
             );
 
             if (existingComment) {
@@ -125,7 +252,7 @@ jobs:
                 comment_id: existingComment.id,
                 body: body,
               });
-              console.log(`Updated existing Trivy comment ID ${existingComment.id}`);
+              console.log(`✅ Updated existing Trivy comment ID ${existingComment.id}`);
             } else {
               // Create new comment
               await github.rest.issues.createComment({
@@ -134,5 +261,5 @@ jobs:
                 issue_number: prNumber,
                 body: body,
               });
-              console.log('Created new Trivy comment');
+              console.log('✅ Created new Trivy comment');
             }
