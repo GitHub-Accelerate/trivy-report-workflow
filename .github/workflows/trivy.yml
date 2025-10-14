@@ -46,6 +46,7 @@ jobs:
             if (fs.existsSync('trivy-results.json')) {
               const rawData = fs.readFileSync('trivy-results.json', 'utf8');
               rawResults = JSON.parse(rawData);
+              console.log('Full Results Structure:', JSON.stringify(rawResults, null, 2));
             }
 
             // Process results for vulnerabilities
@@ -55,7 +56,7 @@ jobs:
 
             // Process results for secrets
             const secretResult = rawResults.Results?.find(r => r.Class === 'secret') || {};
-            const secrets = secretResult.Misconfigurations || secretResult.Vulnerabilities || [];  // Trivy reports secrets under Misconfigurations or Vulnerabilities depending on version
+            const secrets = secretResult.Secrets || [];  // Changed from Misconfigurations/Vulnerabilities
             const secretCount = secrets.length;
 
             // Format results as Markdown
@@ -89,14 +90,12 @@ jobs:
               body += '### Detected Secrets (Critical Issues)\n';
               body += '**Warning**: Exposed secrets can lead to breaches. Review and rotate immediately!\n';
               secrets.forEach((secret, index) => {
-                // Handle structure: Misconfigurations have Title, Description, etc.; adjust based on actual output
-                const title = secret.Title || secret.ID || `Secret ${index + 1}`;
+                const title = secret.Title || secret.RuleID || `Secret ${index + 1}`;
                 const severity = secret.Severity || 'CRITICAL';
                 const match = secret.Match || 'N/A';
                 body += `- **${severity}**: ${title}\n`;
-                body += `  *Location*: ${secretResult.Target || 'Unknown file'} (Line: ${secret.StartLine || 'N/A'})\n`;
-                body += `  *Match*: \`${match.substring(0, 100)}...\` (truncated for security)\n`;
-                body += `  *Description*: ${secret.Description?.substring(0, 200)}...\n\n`;
+                body += `  *Location*: ${secret.StartLine ? `Line ${secret.StartLine}` : 'N/A'}\n`;
+                body += `  *Match*: \`${match.substring(0, 50)}...\` (truncated for security)\n\n`;
               });
               body += '\n<details><summary>Full Secret Results</summary>\n\n';
               body += '```\n' + JSON.stringify(secrets, null, 2) + '\n```\n</details>\n\n';
