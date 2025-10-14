@@ -3,8 +3,8 @@ name: Trivy PR Scan
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [main]  # Adjust to your target branch
-
+    branches: [main, master, develop]  # Adjust to your target branch
+  
 permissions:
   contents: read
   pull-requests: write  # Required for creating/updating PR comments
