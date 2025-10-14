@@ -1,0 +1,217 @@
+name: Trivy Security Scan
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  trivy-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-report.json'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          scanners: 'vuln,secret,config'
+
+      - name: Parse Trivy results
+        id: parse
+        run: |
+          if [ ! -f trivy-report.json ]; then
+            echo "No report file found"
+            exit 1
+          fi
+          
+          # Parse JSON and create summary
+          python3 << 'PYTHON_EOF'
+          import json
+          import os
+          from collections import defaultdict
+          
+          with open('trivy-report.json', 'r') as f:
+              data = json.load(f)
+          
+          # Count vulnerabilities by severity
+          vuln_counts = defaultdict(int)
+          secret_count = 0
+          config_count = 0
+          total_vulns = 0
+          
+          critical_vulns = []
+          high_vulns = []
+          secrets_found = []
+          misconfigs = []
+          
+          if 'Results' in data:
+              for result in data['Results']:
+                  target = result.get('Target', 'Unknown')
+                  
+                  # Process vulnerabilities
+                  if 'Vulnerabilities' in result and result['Vulnerabilities']:
+                      for vuln in result['Vulnerabilities']:
+                          severity = vuln.get('Severity', 'UNKNOWN')
+                          vuln_counts[severity] += 1
+                          total_vulns += 1
+                          
+                          vuln_info = {
+                              'target': target,
+                              'id': vuln.get('VulnerabilityID', 'N/A'),
+                              'pkg': vuln.get('PkgName', 'N/A'),
+                              'version': vuln.get('InstalledVersion', 'N/A'),
+                              'fixed': vuln.get('FixedVersion', 'Not available'),
+                              'title': vuln.get('Title', 'No title'),
+                              'severity': severity
+                          }
+                          
+                          if severity == 'CRITICAL':
+                              critical_vulns.append(vuln_info)
+                          elif severity == 'HIGH':
+                              high_vulns.append(vuln_info)
+                  
+                  # Process secrets
+                  if 'Secrets' in result and result['Secrets']:
+                      for secret in result['Secrets']:
+                          secret_count += 1
+                          secrets_found.append({
+                              'target': target,
+                              'rule': secret.get('RuleID', 'N/A'),
+                              'title': secret.get('Title', 'Secret detected'),
+                              'severity': secret.get('Severity', 'HIGH'),
+                              'match': secret.get('Match', '***')[:50] + '...' if len(secret.get('Match', '')) > 50 else secret.get('Match', '***')
+                          })
+                  
+                  # Process misconfigurations
+                  if 'Misconfigurations' in result and result['Misconfigurations']:
+                      for misconfig in result['Misconfigurations']:
+                          config_count += 1
+                          misconfigs.append({
+                              'target': target,
+                              'id': misconfig.get('ID', 'N/A'),
+                              'title': misconfig.get('Title', 'Misconfiguration detected'),
+                              'severity': misconfig.get('Severity', 'MEDIUM'),
+                              'message': misconfig.get('Message', 'No description')
+                          })
+          
+          # Write counts to environment
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"critical={vuln_counts.get('CRITICAL', 0)}\n")
+              f.write(f"high={vuln_counts.get('HIGH', 0)}\n")
+              f.write(f"medium={vuln_counts.get('MEDIUM', 0)}\n")
+              f.write(f"low={vuln_counts.get('LOW', 0)}\n")
+              f.write(f"secrets={secret_count}\n")
+              f.write(f"misconfigs={config_count}\n")
+              f.write(f"total={total_vulns}\n")
+          
+          # Create detailed markdown report
+          report = "## 🔒 Trivy Security Scan Results\n\n"
+          
+          # Summary section
+          report += "### 📊 Summary\n\n"
+          report += "| Category | Count |\n"
+          report += "|----------|-------|\n"
+          report += f"| 🔴 Critical Vulnerabilities | {vuln_counts.get('CRITICAL', 0)} |\n"
+          report += f"| 🟠 High Vulnerabilities | {vuln_counts.get('HIGH', 0)} |\n"
+          report += f"| 🟡 Medium Vulnerabilities | {vuln_counts.get('MEDIUM', 0)} |\n"
+          report += f"| 🟢 Low Vulnerabilities | {vuln_counts.get('LOW', 0)} |\n"
+          report += f"| 🔑 Secrets Detected | {secret_count} |\n"
+          report += f"| ⚙️ Misconfigurations | {config_count} |\n"
+          report += f"| **Total Issues** | **{total_vulns + secret_count + config_count}** |\n\n"
+          
+          # Critical vulnerabilities
+          if critical_vulns:
+              report += "### 🔴 Critical Vulnerabilities\n\n"
+              for v in critical_vulns[:10]:  # Limit to 10
+                  report += f"**{v['id']}** in `{v['pkg']}@{v['version']}`\n"
+                  report += f"- **File**: {v['target']}\n"
+                  report += f"- **Title**: {v['title']}\n"
+                  report += f"- **Fixed Version**: {v['fixed']}\n\n"
+              if len(critical_vulns) > 10:
+                  report += f"*...and {len(critical_vulns) - 10} more critical vulnerabilities*\n\n"
+          
+          # High vulnerabilities (limited)
+          if high_vulns and len(high_vulns) <= 5:
+              report += "### 🟠 High Vulnerabilities\n\n"
+              for v in high_vulns[:5]:
+                  report += f"**{v['id']}** in `{v['pkg']}@{v['version']}`\n"
+                  report += f"- **File**: {v['target']}\n"
+                  report += f"- **Fixed Version**: {v['fixed']}\n\n"
+          
+          # Secrets
+          if secrets_found:
+              report += "### 🔑 Secrets Detected\n\n"
+              report += "⚠️ **WARNING: Potential secrets found in the codebase!**\n\n"
+              for s in secrets_found:
+                  report += f"**{s['rule']}** - {s['title']}\n"
+                  report += f"- **File**: {s['target']}\n"
+                  report += f"- **Severity**: {s['severity']}\n"
+                  report += f"- **Match**: `{s['match']}`\n\n"
+          
+          # Misconfigurations (limited)
+          if misconfigs and len(misconfigs) <= 5:
+              report += "### ⚙️ Misconfigurations\n\n"
+              for m in misconfigs[:5]:
+                  report += f"**{m['id']}** - {m['title']}\n"
+                  report += f"- **File**: {m['target']}\n"
+                  report += f"- **Severity**: {m['severity']}\n"
+                  report += f"- **Message**: {m['message']}\n\n"
+          
+          report += "\n---\n"
+          report += f"*Scan completed at: {os.environ.get('GITHUB_SHA', 'N/A')[:7]}*\n"
+          report += "*Full report available in workflow artifacts*\n"
+          
+          # Write report to file
+          with open('trivy-comment.md', 'w') as f:
+              f.write(report)
+          
+          PYTHON_EOF
+
+      - name: Find existing comment
+        uses: peter-evans/find-comment@v3
+        id: find-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '🔒 Trivy Security Scan Results'
+
+      - name: Create or update PR comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: trivy-comment.md
+          edit-mode: replace
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          retention-days: 30
+
+      - name: Check for critical issues
+        run: |
+          CRITICAL=${{ steps.parse.outputs.critical }}
+          SECRETS=${{ steps.parse.outputs.secrets }}
+          
+          if [ "$CRITICAL" -gt 0 ] || [ "$SECRETS" -gt 0 ]; then
+            echo "::error::Found $CRITICAL critical vulnerabilities and $SECRETS secrets"
+            echo "::warning::Please review and fix critical security issues before merging"
+            # Uncomment the line below to fail the workflow on critical issues
+            # exit 1
+          fi
